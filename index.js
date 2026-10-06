@@ -12,7 +12,7 @@ const express = require("express");
 const PREFIX = "!";
 const OWNER_NUMBER = "2348144550593";
 const OWNER_LID = "101014040526896";
-const EGG_PTERODACTYL = "2348000000000@s.whatsapp.net";
+const EGG_PTERODACTYL = "2348144550593@s.whatsapp.net";
 const AUTH_FOLDER = "./auth_info_baileys";
 const PORT = process.env.PORT || 3000;
 
