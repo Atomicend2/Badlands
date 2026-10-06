@@ -12,7 +12,7 @@ const express = require("express");
 const PREFIX = "!";
 const OWNER_NUMBER = "2348144550593";
 const OWNER_LID = "101014040526896";
-const EGG_PTERODACTYL = "2348144550593@s.whatsapp.net";
+const EGG_PTERODACTYL = "2348000000000@s.whatsapp.net";
 const AUTH_FOLDER = "./auth_info_baileys";
 const PORT = process.env.PORT || 3000;
 
@@ -20,7 +20,6 @@ let pairingRequested = false;
 let connected = false;
 let sock = null;
 
-// ── keep-alive web server ──────────────────────────────────────────────
 const app = express();
 app.get("/", (_req, res) => res.status(200).send("badlands up"));
 app.get("/health", (_req, res) => res.status(200).json({
@@ -30,7 +29,6 @@ app.get("/health", (_req, res) => res.status(200).json({
 }));
 app.listen(PORT, () => console.log(`[BADLANDS] http on :${PORT}`));
 
-// ── owner resolution: match PN or LID, with alt fallback ───────────────
 function bareJid(jid) {
   if (!jid) return "";
   return jid.split("@")[0].split(":")[0];
@@ -38,23 +36,12 @@ function bareJid(jid) {
 
 function isOwner(msg) {
   const key = msg.key || {};
-  // try every identifier WhatsApp might attach
-  const candidates = new Set();
-  const add = (j) => { if (j) { candidates.add(bareJid(j)); candidates.add(j); } };
-
-  add(key.participant);
-  add(key.participantAlt);
-  add(key.remoteJid);
-  add(key.remoteJidAlt);
-
+  if (key.fromMe) return true;
+  const candidates = [key.participant, key.participantAlt, key.remoteJid, key.remoteJidAlt];
   for (const c of candidates) {
     const b = bareJid(c);
     if (b === OWNER_NUMBER || b === OWNER_LID) return true;
   }
-
-  // self-chat: if fromMe and remoteJid is the bot's own JID, treat as owner
-  if (key.fromMe) return true;
-
   return false;
 }
 
@@ -84,12 +71,26 @@ async function startBot() {
     markOnlineOnConnect: true,
     syncFullHistory: false,
     shouldSyncHistoryMessage: () => false,
+    emitOwnEvents: true,
     keepAliveIntervalMs: 25000,
     connectTimeoutMs: 60000,
     retryRequestDelayMs: 250,
+    getMessage: async () => undefined,
   });
 
   sock.ev.on("creds.update", saveCreds);
+
+  // ── RAW WS FRAME LOGGER — proves whether the server pushes anything ───
+  if (sock.ws && typeof sock.ws.on === "function") {
+    sock.ws.on("message", (data) => {
+      const s = data.toString();
+      // only log interesting frames, not every keepalive
+      if (s.includes('"tag":"message"') || s.includes('"tag":"notification"')) {
+        console.log(`[WS] ${s.slice(0, 400)}`);
+      }
+    });
+    console.log("[BADLANDS] raw WS logger attached");
+  }
 
   if (!state.creds.registered && !pairingRequested) {
     pairingRequested = true;
@@ -122,12 +123,12 @@ async function startBot() {
       if (sock.authState.creds.registered) {
         setTimeout(startBot, 3000);
       } else {
-        console.log("Unpaired socket closed — rerun and enter code fast.");
+        console.log("Unpaired socket closed — rerun.");
       }
     }
   });
 
-  // ── RAW LOGGER: confirms whether messages.upsert fires at all ─────────
+  // ── listener diagnostics ─────────────────────────────────────────────
   sock.ev.on("messages.upsert", ({ messages, type }) => {
     console.log(`[UPSERT] type=${type} count=${messages.length}`);
     for (const m of messages) {
@@ -138,13 +139,11 @@ async function startBot() {
 
   sock.ev.on("messages.upsert", async ({ messages, type }) => {
     if (type !== "notify") return;
-
     for (const msg of messages) {
       if (!msg.message) continue;
       const key = msg.key || {};
       const remoteJid = key.remoteJid;
       if (!remoteJid) continue;
-
       if (!isOwner(msg)) continue;
 
       const text = msg.message.conversation
@@ -155,14 +154,12 @@ async function startBot() {
       const [cmd] = text.slice(PREFIX.length).trim().split(/\s+/);
       const command = cmd.toLowerCase();
 
-      // ── !ping ──
       if (command === "ping") {
         const start = msg.messageTimestamp ? msg.messageTimestamp * 1000 : Date.now();
         await sock.sendMessage(remoteJid, { text: `Pong! ${Date.now() - start}ms` }, { quoted: msg });
         continue;
       }
 
-      // ── !badlands ──
       if (command === "badlands") {
         if (!isGroup(remoteJid)) {
           await sock.sendMessage(remoteJid, { text: "!badlands works only in groups." }, { quoted: msg });
