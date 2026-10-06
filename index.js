@@ -18,8 +18,9 @@ const PORT = process.env.PORT || 3000;
 
 let pairingRequested = false;
 let connected = false;
+let sock = null;
 
-// ── keep-alive web server (Render needs an open port to keep the service up) ──
+// ── keep-alive web server ──────────────────────────────────────────────
 const app = express();
 app.get("/", (_req, res) => res.status(200).send("badlands up"));
 app.get("/health", (_req, res) => res.status(200).json({
@@ -29,12 +30,35 @@ app.get("/health", (_req, res) => res.status(200).json({
 }));
 app.listen(PORT, () => console.log(`[BADLANDS] http on :${PORT}`));
 
-function isOwner(jid) {
-  if (!jid) return false;
-  const bare = jid.split("@")[0].split(":")[0];
-  return bare === OWNER_NUMBER || bare === OWNER_LID;
+// ── owner resolution: match PN or LID, with alt fallback ───────────────
+function bareJid(jid) {
+  if (!jid) return "";
+  return jid.split("@")[0].split(":")[0];
 }
-function isGroup(jid) { return jid.endsWith("@g.us"); }
+
+function isOwner(msg) {
+  const key = msg.key || {};
+  // try every identifier WhatsApp might attach
+  const candidates = new Set();
+  const add = (j) => { if (j) { candidates.add(bareJid(j)); candidates.add(j); } };
+
+  add(key.participant);
+  add(key.participantAlt);
+  add(key.remoteJid);
+  add(key.remoteJidAlt);
+
+  for (const c of candidates) {
+    const b = bareJid(c);
+    if (b === OWNER_NUMBER || b === OWNER_LID) return true;
+  }
+
+  // self-chat: if fromMe and remoteJid is the bot's own JID, treat as owner
+  if (key.fromMe) return true;
+
+  return false;
+}
+
+function isGroup(jid) { return jid && jid.endsWith("@g.us"); }
 
 async function startBot() {
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_FOLDER);
@@ -48,7 +72,7 @@ async function startBot() {
 
   const logger = Pino({ level: "silent" });
 
-  const sock = makeWASocket({
+  sock = makeWASocket({
     version,
     auth: {
       creds: state.creds,
@@ -57,7 +81,12 @@ async function startBot() {
     printQRInTerminal: false,
     logger,
     browser: ["Ubuntu", "Chrome", "22.04.4"],
-    markOnlineOnConnect: false,
+    markOnlineOnConnect: true,
+    syncFullHistory: false,
+    shouldSyncHistoryMessage: () => false,
+    keepAliveIntervalMs: 25000,
+    connectTimeoutMs: 60000,
+    retryRequestDelayMs: 250,
   });
 
   sock.ev.on("creds.update", saveCreds);
@@ -98,54 +127,72 @@ async function startBot() {
     }
   });
 
+  // ── RAW LOGGER: confirms whether messages.upsert fires at all ─────────
+  sock.ev.on("messages.upsert", ({ messages, type }) => {
+    console.log(`[UPSERT] type=${type} count=${messages.length}`);
+    for (const m of messages) {
+      const k = m.key || {};
+      console.log(`[UPSERT] fromMe=${k.fromMe} remoteJid=${k.remoteJid} participant=${k.participant || "-"} alt=${k.remoteJidAlt || k.participantAlt || "-"}`);
+    }
+  });
+
   sock.ev.on("messages.upsert", async ({ messages, type }) => {
     if (type !== "notify") return;
-    const msg = messages[0];
-    if (!msg.message) return;
-    const remoteJid = msg.key.remoteJid;
-    const senderJid = msg.key.participant || msg.key.remoteJid;
-    if (!isOwner(senderJid)) return;
 
-    const text = msg.message.conversation
-      || msg.message.extendedTextMessage?.text
-      || "";
-    if (!text.startsWith(PREFIX)) return;
+    for (const msg of messages) {
+      if (!msg.message) continue;
+      const key = msg.key || {};
+      const remoteJid = key.remoteJid;
+      if (!remoteJid) continue;
 
-    const [cmd] = text.slice(PREFIX.length).trim().split(/\s+/);
-    const command = cmd.toLowerCase();
+      if (!isOwner(msg)) continue;
 
-    if (command === "ping") {
-      const start = msg.messageTimestamp ? msg.messageTimestamp * 1000 : Date.now();
-      await sock.sendMessage(remoteJid, { text: `Pong! ${Date.now() - start}ms` }, { quoted: msg });
-      return;
-    }
+      const text = msg.message.conversation
+        || msg.message.extendedTextMessage?.text
+        || "";
+      if (!text.startsWith(PREFIX)) continue;
 
-    if (command === "badlands") {
-      if (!isGroup(remoteJid)) {
-        await sock.sendMessage(remoteJid, { text: "!badlands works only in groups." }, { quoted: msg });
-        return;
+      const [cmd] = text.slice(PREFIX.length).trim().split(/\s+/);
+      const command = cmd.toLowerCase();
+
+      // ── !ping ──
+      if (command === "ping") {
+        const start = msg.messageTimestamp ? msg.messageTimestamp * 1000 : Date.now();
+        await sock.sendMessage(remoteJid, { text: `Pong! ${Date.now() - start}ms` }, { quoted: msg });
+        continue;
       }
-      try {
-        const metadata = await sock.groupMetadata(remoteJid);
-        const botJid = sock.user.id.split(":")[0] + "@s.whatsapp.net";
-        const me = metadata.participants.find(p => p.id === botJid);
-        if (!me || (me.admin !== "admin" && me.admin !== "superadmin")) {
-          await sock.sendMessage(remoteJid, { text: "Bot is not admin." }, { quoted: msg });
-          return;
+
+      // ── !badlands ──
+      if (command === "badlands") {
+        if (!isGroup(remoteJid)) {
+          await sock.sendMessage(remoteJid, { text: "!badlands works only in groups." }, { quoted: msg });
+          continue;
         }
-        const toDemote = metadata.participants
-          .filter(p => (p.admin === "admin" || p.admin === "superadmin")
-            && p.id !== botJid && !isOwner(p.id) && p.id !== EGG_PTERODACTYL)
-          .map(p => p.id);
-        if (toDemote.length === 0) {
-          await sock.sendMessage(remoteJid, { text: "No admins to demote." }, { quoted: msg });
-          return;
+        try {
+          const metadata = await sock.groupMetadata(remoteJid);
+          const botJid = sock.user.id.split(":")[0] + "@s.whatsapp.net";
+          const me = metadata.participants.find(p => p.id === botJid);
+          if (!me || (me.admin !== "admin" && me.admin !== "superadmin")) {
+            await sock.sendMessage(remoteJid, { text: "Bot is not admin." }, { quoted: msg });
+            continue;
+          }
+          const toDemote = metadata.participants
+            .filter(p => (p.admin === "admin" || p.admin === "superadmin")
+              && p.id !== botJid
+              && bareJid(p.id) !== OWNER_NUMBER
+              && bareJid(p.id) !== OWNER_LID
+              && p.id !== EGG_PTERODACTYL)
+            .map(p => p.id);
+          if (toDemote.length === 0) {
+            await sock.sendMessage(remoteJid, { text: "No admins to demote." }, { quoted: msg });
+            continue;
+          }
+          await sock.groupParticipantsUpdate(remoteJid, toDemote, "demote");
+          await sock.sendMessage(remoteJid, { text: `Demoted ${toDemote.length} admin(s).` }, { quoted: msg });
+        } catch (e) {
+          console.error("[BADLANDS] error:", e.message);
+          await sock.sendMessage(remoteJid, { text: "Badlands failed: " + e.message }, { quoted: msg });
         }
-        await sock.groupParticipantsUpdate(remoteJid, toDemote, "demote");
-        await sock.sendMessage(remoteJid, { text: `Demoted ${toDemote.length} admin(s).` }, { quoted: msg });
-      } catch (e) {
-        console.error("[BADLANDS] error:", e.message);
-        await sock.sendMessage(remoteJid, { text: "Badlands failed: " + e.message }, { quoted: msg });
       }
     }
   });
